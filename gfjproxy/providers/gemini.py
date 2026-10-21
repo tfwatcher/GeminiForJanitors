@@ -151,6 +151,16 @@ def gemini_generate_content(
     except ValueError:
         retries = 0
 
+    # Configure the initial backoff through Render, e.g. 75 or 90 seconds.
+    # A 503 retry resends the full prompt and may affect Google's token quotas.
+    # Values are bounded to prevent accidental multi-minute retry storms.
+    try:
+        retry_delay = min(
+            300.0, max(0.0, float(os.getenv("GFJPROXY_GEMINI_503_RETRY_DELAY", "75")))
+        )
+    except (ValueError, OverflowError):
+        retry_delay = 75.0
+
     # Shares the existing Gemini request timeout among all attempts and delays.
     # This is a best-effort wall-clock budget: individual HTTP IO timeouts still
     # follow httpx2 semantics.
@@ -170,8 +180,8 @@ def gemini_generate_content(
             )
             xlog(user, f"Gemini attempt {attempt + 1}/{retries + 1}: HTTP {response.status_code} ({time.monotonic() - started:.1f}s)")
             if response.status_code == 503 and attempt < retries:
-                delay = 12 * (2 ** attempt) + random.uniform(0, 3)
-                if deadline - time.monotonic() > delay + 15:
+                delay = retry_delay * (2 ** attempt) + random.uniform(0, 3)
+                if deadline - time.monotonic() > delay + 30:
                     xlog(user, f"Gemini 503 overload; retrying in {delay:.1f}s")
                     time.sleep(delay)
                     continue
