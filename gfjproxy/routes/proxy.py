@@ -11,7 +11,7 @@ from ..models import JaiRequest
 from ..storage import storage
 from ..utils import ResponseHelper, comma_split, is_proxy_test
 from ..xuid_secret import xuid_secret
-from ..xuiduser import RedisUserStorage, UserSettings, XUID
+from ..xuiduser import XUID, RedisUserStorage, UserSettings
 
 proxy = Blueprint("proxy", __name__)
 
