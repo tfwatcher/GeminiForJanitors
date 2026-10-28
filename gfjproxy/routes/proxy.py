@@ -1,6 +1,7 @@
 from traceback import print_exception
 
 from flask import Blueprint, abort, request
+from redis.exceptions import RedisError
 
 from .._globals import PROCESS_TIMEOUT
 from ..cooldown import get_cooldown
@@ -10,7 +11,7 @@ from ..models import JaiRequest
 from ..storage import storage
 from ..utils import ResponseHelper, comma_split, is_proxy_test
 from ..xuid_secret import xuid_secret
-from ..xuiduser import XUID, UserSettings, RedisUserStorage
+from ..xuiduser import RedisUserStorage, UserSettings, XUID
 
 proxy = Blueprint("proxy", __name__)
 
@@ -64,7 +65,7 @@ def handle():
             storage._locks[xuid.lockid()].extend(
                 lock_lease_seconds, replace_ttl=True
             )
-        except Exception as exc:
+        except (KeyError, RedisError) as exc:
             xlog(xuid, f"Could not extend Redis request lock: {type(exc).__name__}")
             storage.unlock(xuid)
             return response.build_error(
@@ -146,4 +147,3 @@ def handle():
     storage.unlock(xuid)
 
     return response.build()
-    
