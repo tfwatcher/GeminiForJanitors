@@ -53,8 +53,6 @@ def log_due(category: str) -> bool:
 
 def last_bandwidth_success_age() -> str:
     """Return human-readable elapsed time since a successful bandwidth check."""
-    global _LOCAL_LAST_BANDWIDTH_SUCCESS
-
     timestamp = _LOCAL_LAST_BANDWIDTH_SUCCESS
     client = get_redis_client()
     if client is not None:
