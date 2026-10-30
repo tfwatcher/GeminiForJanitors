@@ -13,6 +13,7 @@ from .._globals import (
 from ..bandwidth import bandwidth_usage
 from ..cooldown import cooldown_policy, get_cooldown
 from ..logging import xlog
+from ..maintenance_logging import log_due
 from ..start_time import START_TIME
 from ..statistics import make_timestamp, query_stats
 from ..storage import get_redis_client, storage
@@ -29,15 +30,16 @@ def index():
     if request.path != "/":
         return redirect("/", code=301)
 
-    xlog(None, "Handling index")
-
-    return render_template(
+    page = render_template(
         "index.html",
         admin=PROXY_ADMIN,
         announcement=storage.announcement,
         title=PROXY_NAME,
         version=PROXY_VERSION,
     )
+    if log_due("index-success"):
+        xlog(None, "Handling index (hourly successful keep-awake check)")
+    return page
 
 
 @system.route("/favicon.ico")
@@ -110,5 +112,4 @@ def stats():
             latest_stats=latest_stats,
         )
 
-    # Return statistics data as JSON
     return statistics_json, 200

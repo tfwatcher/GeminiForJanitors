@@ -1,7 +1,9 @@
 from traceback import print_exception
 
 from flask import Blueprint, abort, request
+from redis.exceptions import RedisError
 
+from .._globals import PROCESS_TIMEOUT
 from ..cooldown import get_cooldown
 from ..handlers import handle_chat_message, handle_proxy_test
 from ..logging import xlog, xlogtime
@@ -9,7 +11,7 @@ from ..models import JaiRequest
 from ..storage import storage
 from ..utils import ResponseHelper, comma_split, is_proxy_test
 from ..xuid_secret import xuid_secret
-from ..xuiduser import XUID, UserSettings
+from ..xuiduser import XUID, RedisUserStorage, UserSettings
 
 proxy = Blueprint("proxy", __name__)
 
@@ -50,6 +52,25 @@ def handle():
         return response.build_error(
             "Concurrent use is not allowed. Please wait a moment.", 403
         )
+
+    # Redis's upstream per-user lock expires after 60 seconds, even if the
+    # Google request is still running. Extend this *owned* lock to cover the
+    # configured process timeout plus a grace period (the default 600s
+    # process timeout yields a 710s lease). This prevents a concurrent
+    # JanitorAI retry from starting another costly Google request.
+    # Normal processing still releases the lock immediately at completion.
+    if isinstance(storage, RedisUserStorage):
+        try:
+            lock_lease_seconds = PROCESS_TIMEOUT + 120
+            storage._locks[xuid.lockid()].extend(
+                lock_lease_seconds, replace_ttl=True
+            )
+        except (KeyError, RedisError) as exc:
+            xlog(xuid, f"Could not extend Redis request lock: {type(exc).__name__}")
+            storage.unlock(xuid)
+            return response.build_error(
+                "Could not secure request lock. Please retry later.", 503
+            )
 
     user = UserSettings(storage, xuid)
 
