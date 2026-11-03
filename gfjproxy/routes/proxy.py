@@ -225,9 +225,9 @@ def handle(route_name: str | None = None):
         not proxy_test
         and response.status == 200
         and any(item.kind is MessageKind.CHAT for item in response._messages)
+        and remember_response(xuid, cache_request, response.message)
     ):
-        if remember_response(xuid, cache_request, response.message):
-            xlog(user, "Response recovery: saved successful reply in Redis")
+        xlog(user, "Response recovery: saved successful reply in Redis")
 
     if user.valid:
         user.save()
