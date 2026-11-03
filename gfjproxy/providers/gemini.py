@@ -290,7 +290,7 @@ def gemini_generate_content(
                 )
 
             if response.status_code == 503 and attempt < retries:
-                delay = retry_delay * (2 ** attempt) + random.uniform(0, 3)
+                delay = retry_delay + random.uniform(0, 3)
                 if deadline - time.monotonic() > delay + 30:
                     xlog(user, f"Gemini 503 overload; retrying in {delay:.1f}s")
                     time.sleep(delay)
