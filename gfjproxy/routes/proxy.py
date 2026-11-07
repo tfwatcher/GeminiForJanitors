@@ -93,9 +93,9 @@ def handle(route_name: str | None = None):
     api_keys = comma_split(request_auth[1])
     xuid = XUID(api_keys[0], xuid_secret)
 
-    # The URL's selected route is part of the recovery fingerprint. Otherwise
-    # identical request bodies sent to different LoreBary URLs could collide.
-    cache_request = {**request_json, "_gfj_route_path": request_path}
+    # Recovery uses the latest successful reply for this proxy user, regardless
+    # of changes to the original conversation, model, or provider route.
+    cache_request = request_json
 
     # Explicit recovery bypasses cooldown, key rotation, and upstream entirely.
     # Ordinary identical requests (including Regenerate) always reach Google.
@@ -104,19 +104,18 @@ def handle(route_name: str | None = None):
         if is_recovery:
             cached = restore_response(xuid, original_request)
             if cached is None:
-                xlog(xuid, "Response recovery MISS (no matching saved response)")
+                xlog(xuid, "Response recovery MISS (no saved reply available)")
                 return response.build_error(
-                    "No matching saved reply. Recovery requires exactly the "
-                    "original conversation, provider route, and settings. "
-                    "Remove //recover to request a new reply.",
+                    "No saved reply available for this proxy user. "
+                    "It may have been evicted or saved under a different first API key. "
+                    "Remove //recover to generate a new reply.",
                     404,
                 )
             xlog(xuid, "Response recovery HIT (upstream was not contacted)")
             return response.add_message(cached).build()
 
     # An earlier recovered message may be part of later JanitorAI history.
-    # Keep its control marker out of future prompts while preserving the
-    # original request body for strict cache matching.
+    # Keep its control marker out of future model prompts.
     strip_saved_recovery_markers(jai_req.messages)
 
     if not storage.lock(xuid):
