@@ -23,11 +23,14 @@ from ..response_recovery import (
     strip_saved_recovery_markers,
 )
 from ..storage import storage
-from ..wait_control import (
-    WAIT_LEASE_SECONDS, WaitControlUnavailable,
-    begin_wait, end_wait, stop_wait,
-)
 from ..utils import MessageKind, ResponseHelper, comma_split, is_proxy_test
+from ..wait_control import (
+    WAIT_LEASE_SECONDS,
+    WaitControlUnavailable,
+    begin_wait,
+    end_wait,
+    stop_wait,
+)
 from ..xuid_secret import xuid_secret
 from ..xuiduser import XUID, RedisUserStorage, UserSettings
 
@@ -316,7 +319,7 @@ def handle(route_name: str | None = None):
         try:
             owned_token = storage._locks[xuid.lockid()].local.token
             if not isinstance(owned_token, bytes):
-                raise RuntimeError("Cannot get Redis lock owner token")
+                raise TypeError("Cannot get Redis lock owner token")
             lease_stop = threading.Event()
             threading.Thread(
                 target=_renew_no_timeout_lock,
@@ -324,7 +327,7 @@ def handle(route_name: str | None = None):
                 daemon=True,
                 name="gfj-notimeout-redis-lock",
             ).start()
-        except (KeyError, RuntimeError) as exc:
+        except (KeyError, TypeError, RuntimeError) as exc:
             if lease_stop is not None:
                 lease_stop.set()
             if wait_token is not None:
