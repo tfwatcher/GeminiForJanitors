@@ -1,9 +1,11 @@
 import json
+import math
 import os
 import random
 import secrets
 import threading
 import time
+from contextvars import ContextVar
 from typing import Any
 
 import httpx2
@@ -13,9 +15,124 @@ from ..http_client import http_client
 from ..logging import xlog
 from ..models import JaiMessage, JaiResult, JaiResultMetadata, JaiResultTokenUsage
 from ..statistics import track_stats
+from ..wait_control import wait_should_stop
 from ..xuiduser import XUID
 
 ################################################################################
+
+# Scoped to the active Flask request; never log or persist the API keys.
+# The first entry is the normal round-robin key, followed by the other keys.
+gemini_key_candidates: ContextVar[tuple[tuple[int, str], ...]] = ContextVar(
+    "gfj_gemini_key_candidates", default=()
+)
+# An opt-in one-message override. This does NOT change PROCESS_TIMEOUT,
+# Gunicorn, Render, Google, or JanitorAI's independent timeouts.
+gemini_no_timeout: ContextVar[bool] = ContextVar(
+    "gfj_gemini_no_timeout", default=False
+)
+# The token is registered by the Flask route and checked from this request's
+# cancellable HTTP wait. No other request can cancel it via a stale token.
+gemini_wait_token: ContextVar[str | None] = ContextVar(
+    "gfj_gemini_wait_token", default=None
+)
+
+
+class WaitCancelled(Exception):
+    """The user's authenticated //stopwait aborted this HTTP wait."""
+
+
+def _cancellable_google_post(
+    user: XUID,
+    token: str,
+    model: str,
+    current_key: str,
+    gemini_request: dict,
+):
+    """Cooperatively stop a live Google HTTP call via Gunicorn's gevent worker.
+
+    A private HTTP client is used for cancellable requests, so killing this
+    greenlet cannot close the shared connection pool used by normal requests.
+    The original request holds its Redis lock until the task is actually
+    terminated, preventing a duplicate in-flight generation.
+    """
+    from gevent import spawn
+
+    def do_request():
+        with httpx2.Client(http2=True, timeout=None, max_redirects=0) as client:
+            return client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": current_key},
+                json=gemini_request,
+                timeout=None,
+            )
+
+    task = spawn(do_request)
+    try:
+        while True:
+            # Poll across Gunicorn workers via Redis. The task runs in a
+            # greenlet with gevent-monkey-patched socket I/O on Render.
+            task.join(timeout=2.0)
+            if wait_should_stop(user, token):
+                xlog(user, "//notimeout request cancelled/lost ownership; stopping HTTP call")
+                task.kill(block=True)
+                raise WaitCancelled()
+            if task.ready():
+                return task.get()
+    finally:
+        # Do not release the user's request lock while Google still runs.
+        if not task.ready():
+            task.kill(block=True)
+
+
+def gemini_retry_config() -> tuple[int, float]:
+    """Return bounded retries and delay; shared by the provider and lock lease."""
+    try:
+        retries = min(2, max(0, int(os.getenv("GFJPROXY_GEMINI_503_RETRIES", "0"))))
+    except ValueError:
+        retries = 0
+    try:
+        delay = float(os.getenv("GFJPROXY_GEMINI_503_RETRY_DELAY", "75"))
+        retry_delay = min(300.0, max(0.0, delay)) if math.isfinite(delay) else 75.0
+    except (ValueError, OverflowError):
+        retry_delay = 75.0
+    return retries, retry_delay
+
+
+def gemini_max_lock_seconds() -> int:
+    """Maximum intended duration including attempts, jitter and cleanup margin.
+
+    Key rotation on HTTP 429 happens *inside* an attempt's time window, so the
+    number of Google keys does not multiply this lease. This is an upper bound
+    for the normal non-streaming HTTP case; HTTP socket timeouts are inactivity
+    based, not a hard interruption of an actively streaming connection.
+    """
+    retries, retry_delay = gemini_retry_config()
+    return math.ceil(
+        (retries + 1) * PROCESS_TIMEOUT
+        + retries * (retry_delay + 3.0)
+        + 120.0
+    )
+
+
+def _sleep_for_retry(user: XUID, cause: str, delay_seconds: float) -> None:
+    actual = delay_seconds + random.uniform(0, 3)
+    xlog(user, f"Gemini {cause}; retrying in {actual:.1f}s")
+    time.sleep(actual)
+
+
+def _google_key(api_key: str) -> str:
+    """Accept explicit google/ prefixed keys as well as ordinary Google keys."""
+    return api_key.split("/", maxsplit=1)[1] if api_key.lower().startswith("google/") else api_key
+
+
+def _quota_all_keys_error(count: int) -> JaiResult:
+    track_stats("g.failed.client.quota")
+    return JaiResult(
+        429,
+        f"All {count} configured Google API key(s) returned HTTP 429 "
+        "(rate limit or quota exhausted) for this request. "
+        "No generation retry was consumed for these 429 responses.",
+    )
 
 
 def _diag_enabled() -> bool:
@@ -41,18 +158,21 @@ def _diag_waiting(
     trace_id: str,
     attempt_label: str,
     started: float,
-    deadline: float,
+    deadline: float | None,
     stopped: threading.Event,
     interval: float,
 ) -> None:
     """Report a still-pending call; never access request content or credentials."""
     while not stopped.wait(interval):
         elapsed = time.monotonic() - started
-        remaining = max(0.0, deadline - time.monotonic())
+        remaining = (
+            f"{max(0.0, deadline - time.monotonic()):.1f}s"
+            if deadline is not None else "disabled by //notimeout"
+        )
         xlog(
             user,
             f"[Gemini diag {trace_id}] attempt {attempt_label} STILL WAITING "
-            f"after {elapsed:.1f}s (budget remaining {remaining:.1f}s)",
+            f"after {elapsed:.1f}s (GFJ budget remaining {remaining})",
         )
 
 
@@ -185,138 +305,180 @@ def gemini_generate_content(
         elif key == "search" and value:
             gemini_request["tools"] = [{"googleSearch": {}}]
 
-    # Disabled by default. Set GFJPROXY_GEMINI_503_RETRIES=1 to enable
-    # a single retry. Cap retries at two to protect limited API quotas.
-    try:
-        retries = min(2, max(0, int(os.getenv("GFJPROXY_GEMINI_503_RETRIES", "0"))))
-    except ValueError:
+    # Each generation attempt receives its OWN PROCESS_TIMEOUT window.
+    # HTTP 429 rotates keys within that same attempt and is not a generation
+    # retry. Only 503 responses and socket timeouts advance the attempt count.
+    retries, retry_delay = gemini_retry_config()
+    no_timeout = gemini_no_timeout.get()
+    if no_timeout:
+        # No generation retry at all, even on 503 or socket failure.
+        # HTTP 429 key failover is NOT a generation retry and still works.
         retries = 0
-
-    # Configure the initial backoff through Render, e.g. 75 or 90 seconds.
-    # A 503 retry resends the full prompt and may affect Google's token quotas.
-    # Values are bounded to prevent accidental multi-minute retry storms.
-    try:
-        retry_delay = min(
-            300.0, max(0.0, float(os.getenv("GFJPROXY_GEMINI_503_RETRY_DELAY", "75")))
-        )
-    except (ValueError, OverflowError):
-        retry_delay = 75.0
-
-    # Shares the existing Gemini request timeout among all attempts and delays.
-    # This is a best-effort wall-clock budget: individual HTTP IO timeouts still
-    # follow httpx2 semantics. Diagnostic logging changes none of these rules.
-    deadline = time.monotonic() + PROCESS_TIMEOUT
+    max_attempts = retries + 1
+    configured_keys = gemini_key_candidates.get()
+    keys = configured_keys or ((1, api_key),)
+    keys = tuple((index, _google_key(key)) for index, key in keys)
+    exhausted_keys: set[int] = set()
+    key_cursor = 0
     diagnostics = _diag_enabled()
     trace_id = secrets.token_hex(4) if diagnostics else ""
-    attempt_label = "not started"
-    attempt_started = None
 
     if diagnostics:
-        # Log only aggregate request size, never the prompt text or API keys.
+        # Never log prompts, personal data or API credentials.
         try:
             payload_bytes = len(json.dumps(gemini_request, ensure_ascii=False).encode("utf-8"))
         except (TypeError, ValueError):
-            payload_bytes = -1  # Diagnostics must not prevent generation.
+            payload_bytes = -1
         xlog(
             user,
             f"[Gemini diag {trace_id}] START model={model} "
             f"messages={len(messages)} payload_bytes={payload_bytes} "
-            f"attempts={retries + 1} total_budget={PROCESS_TIMEOUT}s",
+            f"attempts={max_attempts} "
+            f"attempt_budget={'disabled' if no_timeout else str(PROCESS_TIMEOUT) + 's'} "
+            f"key_count={len(keys)} "
+            f"lock={'renewed' if no_timeout else str(gemini_max_lock_seconds()) + 's'}",
         )
 
     try:
-        for attempt in range(retries + 1):
-            remaining = deadline - time.monotonic()
-            if remaining <= 5:
+        finished = False
+        for attempt in range(max_attempts):
+            # Normal mode: every retry starts a fresh process-derived timeout;
+            # 429 key switches share it. //notimeout skips the GFJ deadline.
+            deadline = None if no_timeout else time.monotonic() + PROCESS_TIMEOUT
+            attempt_label = f"{attempt + 1}/{max_attempts}"
+
+            while True:
+                if len(exhausted_keys) == len(keys):
+                    xlog(user, f"Gemini all {len(keys)} keys returned 429; stopping")
+                    return _quota_all_keys_error(len(keys))
+
+                # Skip keys that already returned 429 in this request.
+                while key_cursor in exhausted_keys:
+                    key_cursor = (key_cursor + 1) % len(keys)
+
+                remaining = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
+                    if attempt < retries:
+                        _sleep_for_retry(user, "attempt window exhausted", retry_delay)
+                        break
+                    track_stats("g.time_out")
+                    return JaiResult(504, "Gateway Timeout")
+
+                key_number, current_key = keys[key_cursor]
+                started = time.monotonic()
+                stopped = None
                 if diagnostics:
+                    timeout_description = (
+                        "disabled" if remaining is None else f"{remaining:.1f}s"
+                    )
                     xlog(
                         user,
-                        f"[Gemini diag {trace_id}] TOTAL BUDGET EXHAUSTED "
-                        f"before attempt {attempt + 1}/{retries + 1} "
-                        f"(remaining {remaining:.1f}s)",
+                        f"[Gemini diag {trace_id}] attempt {attempt_label} "
+                        f"Key {key_number}/{len(keys)} START "
+                        f"(HTTP timeout {timeout_description})",
                     )
-                track_stats("g.time_out")
-                return JaiResult(504, "Gateway Timeout")
+                    stopped = threading.Event()
+                    try:
+                        threading.Thread(
+                            target=_diag_waiting,
+                            args=(
+                                user, trace_id, attempt_label, started,
+                                deadline, stopped, _diag_interval(),
+                            ),
+                            daemon=True,
+                            name="gfj-gemini-diagnostics",
+                        ).start()
+                    except RuntimeError:
+                        stopped.set()
+                        xlog(user, f"[Gemini diag {trace_id}] heartbeat unavailable")
 
-            started = time.monotonic()
-            attempt_started = started
-            attempt_label = f"{attempt + 1}/{retries + 1}"
-            stopped = None
-            if diagnostics:
-                xlog(
-                    user,
-                    f"[Gemini diag {trace_id}] attempt {attempt_label} START "
-                    f"(HTTP timeout {remaining:.1f}s)",
-                )
-                stopped = threading.Event()
                 try:
-                    threading.Thread(
-                        target=_diag_waiting,
-                        args=(
-                            user, trace_id, attempt_label, started,
-                            deadline, stopped, _diag_interval(),
-                        ),
-                        daemon=True,
-                        name="gfj-gemini-diagnostics",
-                    ).start()
-                except RuntimeError:
-                    # A lack of available diagnostic threads must not block RP.
-                    stopped.set()
-                    xlog(user, f"[Gemini diag {trace_id}] heartbeat unavailable")
+                    if no_timeout:
+                        token = gemini_wait_token.get()
+                        if not token:
+                            raise RuntimeError("Missing //notimeout cancellation token")
+                        response = _cancellable_google_post(
+                            user, token, model, current_key, gemini_request
+                        )
+                    else:
+                        response = http_client.post(
+                            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                            headers={"x-goog-api-key": current_key},
+                            json=gemini_request,
+                            timeout=remaining,
+                        )
+                except httpx2.TimeoutException as exc:
+                    elapsed = time.monotonic() - started
+                    if diagnostics:
+                        xlog(
+                            user,
+                            f"[Gemini diag {trace_id}] attempt {attempt_label} "
+                            f"Key {key_number}/{len(keys)} TIMEOUT "
+                            f"type={type(exc).__name__}; elapsed {elapsed:.1f}s",
+                        )
+                    if attempt < retries:
+                        _sleep_for_retry(user, "read timeout", retry_delay)
+                        break
+                    track_stats("g.time_out")
+                    return JaiResult(504, "Gateway Timeout")
+                finally:
+                    if stopped is not None:
+                        stopped.set()
 
-            try:
-                response = http_client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers={"x-goog-api-key": api_key},
-                    json=gemini_request,
-                    timeout=remaining,
-                )
-            finally:
-                if stopped is not None:
-                    stopped.set()
-
-            elapsed = time.monotonic() - started
-            xlog(
-                user,
-                f"Gemini attempt {attempt + 1}/{retries + 1}: "
-                f"HTTP {response.status_code} ({elapsed:.1f}s)",
-            )
-            if diagnostics:
+                elapsed = time.monotonic() - started
                 xlog(
                     user,
-                    f"[Gemini diag {trace_id}] attempt {attempt_label} END "
-                    f"HTTP {response.status_code}; elapsed {elapsed:.1f}s; "
-                    f"total budget remaining {max(0.0, deadline - time.monotonic()):.1f}s",
+                    f"Gemini attempt {attempt_label} Key {key_number}/{len(keys)}: "
+                    f"HTTP {response.status_code} ({elapsed:.1f}s)",
                 )
-
-            if response.status_code == 503 and attempt < retries:
-                delay = retry_delay + random.uniform(0, 3)
-                if deadline - time.monotonic() > delay + 30:
-                    xlog(user, f"Gemini 503 overload; retrying in {delay:.1f}s")
-                    time.sleep(delay)
-                    continue
                 if diagnostics:
+                    remaining_description = (
+                        "disabled" if deadline is None
+                        else f"{max(0.0, deadline - time.monotonic()):.1f}s"
+                    )
                     xlog(
                         user,
-                        f"[Gemini diag {trace_id}] retry SKIPPED "
-                        f"(backoff {delay:.1f}s plus 30s safety margin "
-                        f"exceeds remaining budget)",
+                        f"[Gemini diag {trace_id}] attempt {attempt_label} "
+                        f"END HTTP {response.status_code}; elapsed {elapsed:.1f}s; "
+                        f"attempt remaining {remaining_description}",
                     )
-            response.raise_for_status()
-            gemini_result = response.json()
-            break
-    except httpx2.TimeoutException as exc:
-        if diagnostics:
-            elapsed = (
-                time.monotonic() - attempt_started
-                if attempt_started is not None else 0.0
-            )
-            xlog(
-                user,
-                f"[Gemini diag {trace_id}] attempt {attempt_label} "
-                f"TIMEOUT type={type(exc).__name__}; elapsed {elapsed:.1f}s; "
-                f"total budget remaining {max(0.0, deadline - time.monotonic()):.1f}s",
-            )
+
+                if response.status_code == 429:
+                    # 429 is a quota/key-selection issue, NOT a generation
+                    # retry. Do not try this key again within this request.
+                    exhausted_keys.add(key_cursor)
+                    if len(exhausted_keys) == len(keys):
+                        xlog(user, f"Gemini all {len(keys)} keys returned 429; stopping")
+                        return _quota_all_keys_error(len(keys))
+                    key_cursor = (key_cursor + 1) % len(keys)
+                    xlog(
+                        user,
+                        f"Gemini Key {key_number}/{len(keys)} rate-limited (429); "
+                        f"trying another key within attempt {attempt_label}",
+                    )
+                    continue
+
+                if response.status_code == 503 and attempt < retries:
+                    _sleep_for_retry(user, "503 overload", retry_delay)
+                    break
+
+                # Other failures are returned through the existing Google
+                # error parser. No retry on safety/auth/model errors.
+                response.raise_for_status()
+                gemini_result = response.json()
+                finished = True
+                break
+
+            if finished:
+                break
+        else:
+            # Defensive fallback: all attempts were exhausted by 503/timeouts.
+            track_stats("g.time_out")
+            return JaiResult(504, "Gateway Timeout")
+
+    except WaitCancelled:
         track_stats("g.time_out")
         return JaiResult(504, "Gateway Timeout")
     except httpx2.HTTPStatusError as e:
