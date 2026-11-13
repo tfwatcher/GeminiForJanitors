@@ -561,9 +561,8 @@ def gemini_generate_content(
                 except httpx2.TimeoutException as exc:
                     elapsed = time.monotonic() - started
                     if diagnostics:
-                        _log_connection_failure(
-                            user, trace_id, attempt_label, key_number, exc, connection_trace
-                        )
+                        # A configured timeout is expected; keep the existing
+                        # concise timeout log, not the full HTTP transport trace.
                         xlog(
                             user,
                             f"[Gemini diag {trace_id}] attempt {attempt_label} "
