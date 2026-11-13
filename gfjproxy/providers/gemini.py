@@ -1,3 +1,4 @@
+import errno
 import json
 import math
 import os
@@ -5,6 +6,7 @@ import random
 import secrets
 import threading
 import time
+from collections import deque
 from contextvars import ContextVar
 from typing import Any
 
@@ -36,6 +38,143 @@ gemini_wait_token: ContextVar[str | None] = ContextVar(
     "gfj_gemini_wait_token", default=None
 )
 
+# Request-local callback. The cancellable gevent greenlet captures the callback
+# before it is spawned, so it receives the same trace without changing the
+# //stopwait call interface or leaking trace state to concurrent requests.
+_gemini_connection_trace: ContextVar["_ConnectionTrace | None"] = ContextVar(
+    "gfj_gemini_connection_trace", default=None
+)
+
+
+class _ConnectionTrace:
+    """Bounded, redacted HTTP transport timeline for one Google POST.
+
+    httpx2's `extensions={"trace": callback}` exposes high-level events from
+    httpcore2. It does NOT expose every HTTP/2 control frame, nor can it prove
+    whether a remote peer, intermediary, or local client initiated the close.
+    Store only approved event names, elapsed times and exception class names:
+    never stringify raw event dictionaries (which can contain API-key headers,
+    request objects, or complete response data).
+    """
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.events = deque(maxlen=16)
+        self.tcp_connected = False
+        self.tls_connected = False
+        self.request_sent = False
+        self.response_headers = False
+
+    def __call__(self, event_name, info):
+        # Callback failures must never interrupt actual generation.
+        try:
+            if not isinstance(event_name, str):
+                return
+            parts = event_name.split(".")
+            if (
+                len(parts) != 3
+                or parts[0] not in ("connection", "http2", "http11")
+                or parts[2] not in ("started", "complete", "failed")
+                or not parts[1].replace("_", "").isalnum()
+            ):
+                return
+            if event_name == "connection.connect_tcp.complete":
+                self.tcp_connected = True
+            elif event_name == "connection.start_tls.complete":
+                self.tls_connected = True
+            elif event_name in (
+                "http2.send_request_body.complete",
+                "http11.send_request_body.complete",
+            ):
+                self.request_sent = True
+            elif event_name in (
+                "http2.receive_response_headers.complete",
+                "http11.receive_response_headers.complete",
+            ):
+                self.response_headers = True
+            elapsed = max(0.0, time.monotonic() - self.started)
+            failure_type = ""
+            if parts[2] == "failed" and isinstance(info, dict):
+                failure = info.get("exception")
+                if failure is not None:
+                    failure_type = "(" + type(failure).__name__ + ")"
+            self.events.append(f"{elapsed:.1f}s:{event_name}{failure_type}")
+        except Exception:  # ruff: ignore[BLE001]
+            return
+
+    def summary(self, exc):
+        """Report where the error was observed, not an unprovable closer."""
+        name = type(exc).__name__
+        if name == "LocalProtocolError":
+            detection = "local_http2_protocol_state"
+        elif name == "RemoteProtocolError":
+            detection = "remote_protocol_problem_reported_by_client"
+        elif name in ("ReadError", "WriteError", "CloseError"):
+            detection = "socket_read_write_failure"
+        elif name in ("ConnectError", "ConnectTimeout"):
+            detection = "connection_establishment_failure"
+        elif name in ("ReadTimeout", "WriteTimeout", "PoolTimeout"):
+            detection = "client_wait_limit_reached"
+        else:
+            detection = "transport_error_unspecified"
+
+        # A LocalProtocolError means the *local library* detected an invalid
+        # state transition. It does NOT establish who closed the connection.
+        marker = str(exc)
+        detail = (
+            "recv_ping_after_closed"
+            if "ConnectionInputs.RECV_PING" in marker and "ConnectionState.CLOSED" in marker
+            else "none_identified"
+        )
+        # Surface concrete socket evidence if it is preserved by the transport.
+        # ECONNRESET can indicate a peer/intermediary reset, but still cannot
+        # identify whether Google itself or a network intermediary sent it.
+        socket_evidence = "none_available"
+        nested = exc
+        visited = set()
+        for _ in range(5):
+            if id(nested) in visited:
+                break
+            visited.add(id(nested))
+            number = getattr(nested, "errno", None)
+            if number == errno.ECONNRESET:
+                socket_evidence = "connection_reset_observed"
+                break
+            if number == errno.EPIPE:
+                socket_evidence = "write_to_closed_socket"
+                break
+            if number == errno.ETIMEDOUT:
+                socket_evidence = "operating_system_timeout"
+                break
+            nested = getattr(nested, "__cause__", None) or getattr(
+                nested, "__context__", None
+            )
+            if nested is None:
+                break
+
+        history = ",".join(self.events) if self.events else "none_from_transport"
+        return (
+            f"error={name} detected_at={detection} "
+            "closure_initiator=UNKNOWN "
+            f"socket_evidence={socket_evidence} "
+            f"http2_marker={detail} "
+            f"tcp_connection={'new_observed' if self.tcp_connected else 'reused_or_unobserved'} "
+            f"tls={'complete' if self.tls_connected else 'unobserved'} "
+            f"request_body_sent={'yes' if self.request_sent else 'not_confirmed'} "
+            f"response_headers={'received' if self.response_headers else 'not_received'} "
+            f"recent_transport_events=[{history}]"
+        )
+
+
+def _log_connection_failure(user, trace_id, attempt_label, key_number, exc, timeline):
+    """Log safe transport evidence only when existing diagnostics are on."""
+    if timeline is not None:
+        xlog(
+            user,
+            f"[Gemini conn {trace_id}] attempt {attempt_label} "
+            f"Key {key_number}: {timeline.summary(exc)}",
+        )
+
 
 class WaitCancelled(Exception):
     """The user's authenticated //stopwait aborted this HTTP wait."""
@@ -57,6 +196,9 @@ def _cancellable_google_post(
     """
     from gevent import spawn
 
+    # Capture before spawn: the child greenlet may not inherit ContextVars.
+    timeline = _gemini_connection_trace.get()
+
     def do_request():
         with httpx2.Client(http2=True, timeout=None, max_redirects=0) as client:
             return client.post(
@@ -64,6 +206,7 @@ def _cancellable_google_post(
                 headers={"x-goog-api-key": current_key},
                 json=gemini_request,
                 timeout=None,
+                **({"extensions": {"trace": timeline}} if timeline else {}),
             )
 
     task = spawn(do_request)
@@ -368,6 +511,7 @@ def gemini_generate_content(
 
                 key_number, current_key = keys[key_cursor]
                 started = time.monotonic()
+                connection_trace = _ConnectionTrace() if diagnostics else None
                 stopped = None
                 if diagnostics:
                     timeout_description = (
@@ -399,19 +543,27 @@ def gemini_generate_content(
                         token = gemini_wait_token.get()
                         if not token:
                             raise RuntimeError("Missing //notimeout cancellation token")
-                        response = _cancellable_google_post(
-                            user, token, model, current_key, gemini_request
-                        )
+                        tracing_token = _gemini_connection_trace.set(connection_trace)
+                        try:
+                            response = _cancellable_google_post(
+                                user, token, model, current_key, gemini_request
+                            )
+                        finally:
+                            _gemini_connection_trace.reset(tracing_token)
                     else:
                         response = http_client.post(
                             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                             headers={"x-goog-api-key": current_key},
                             json=gemini_request,
                             timeout=remaining,
+                            **({"extensions": {"trace": connection_trace}} if diagnostics else {}),
                         )
                 except httpx2.TimeoutException as exc:
                     elapsed = time.monotonic() - started
                     if diagnostics:
+                        _log_connection_failure(
+                            user, trace_id, attempt_label, key_number, exc, connection_trace
+                        )
                         xlog(
                             user,
                             f"[Gemini diag {trace_id}] attempt {attempt_label} "
@@ -423,6 +575,34 @@ def gemini_generate_content(
                         break
                     track_stats("g.time_out")
                     return JaiResult(504, "Gateway Timeout")
+                except (httpx2.ProtocolError, httpx2.NetworkError) as exc:
+                    # A transport failure is not a Google HTTP error response.
+                    # In particular, HTTP/2 can report LocalProtocolError when
+                    # a connection is closed while receiving a PING frame.
+                    # Honor the existing retry budget in normal mode, but never
+                    # retry a //notimeout request (retries is zero in that mode).
+                    error_name = type(exc).__name__
+                    elapsed = time.monotonic() - started
+                    if diagnostics:
+                        _log_connection_failure(
+                            user, trace_id, attempt_label, key_number, exc, connection_trace
+                        )
+                    xlog(
+                        user,
+                        f"Gemini network/protocol failure on attempt {attempt_label} "
+                        f"Key {key_number}/{len(keys)}: {error_name} "
+                        f"after {elapsed:.1f}s",
+                    )
+                    if attempt < retries:
+                        _sleep_for_retry(user, "connection/protocol failure", retry_delay)
+                        break
+                    track_stats("g.failed.network")
+                    return JaiResult(
+                        502,
+                        "Google connection failed (network/HTTP protocol error). "
+                        "The request did not return a usable response. "
+                        "Please retry manually.",
+                    )
                 finally:
                     if stopped is not None:
                         stopped.set()
