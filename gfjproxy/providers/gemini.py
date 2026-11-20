@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from contextvars import ContextVar
+from itertools import count
 from typing import Any
 
 import httpx2
@@ -263,6 +264,104 @@ def _sleep_for_retry(user: XUID, cause: str, delay_seconds: float) -> None:
     time.sleep(actual)
 
 
+# The no-timeout mode never applies an HTTP read deadline. When Google itself
+# reports a quota cooldown, however, do not busy-loop on a limited project.
+# Ten minutes is intentionally longer than a one-minute quota window.
+_NO_TIMEOUT_MINUTE_COOLDOWN = 600.0
+_NO_TIMEOUT_UNKNOWN_COOLDOWN = 600.0
+_NO_TIMEOUT_POLL_SECONDS = 2.0
+
+
+def _no_timeout_check_cancelled(user: XUID, token: str) -> None:
+    """Cancel even while between Google calls or waiting for quota reset."""
+    if wait_should_stop(user, token):
+        raise WaitCancelled()
+
+
+def _no_timeout_sleep(user: XUID, token: str, cause: str, seconds: float) -> None:
+    """A cancellable, low-CPU delay; respects the existing Redis cancel token."""
+    delay = max(0.0, seconds)
+    xlog(user, f"Gemini //notimeout {cause}; waiting {delay:.1f}s")
+    end = time.monotonic() + delay
+    while True:
+        _no_timeout_check_cancelled(user, token)
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(left, _NO_TIMEOUT_POLL_SECONDS))
+
+
+def _no_timeout_quota_info(response) -> tuple[str, float]:
+    """Classify Google's 429 without leaking response content or API keys.
+
+    Daily exhaustion is terminal only if all keys report daily exhaustion.
+    Unknown 429s are conservatively treated as temporary to avoid giving up
+    when Google omits a QuotaFailure identifier.
+    """
+    ids = []
+    retry_hint = 0.0
+    try:
+        payload = response.json()
+        error = payload.get("error", payload) if isinstance(payload, dict) else {}
+        if isinstance(error, dict):
+            message = error.get("message", "")
+            if isinstance(message, str):
+                ids.append(message)
+            for detail in error.get("details", []):
+                if not isinstance(detail, dict):
+                    continue
+                for violation in detail.get("violations", []):
+                    if isinstance(violation, dict):
+                        for field in ("quotaId", "description", "subject"):
+                            value = violation.get(field)
+                            if isinstance(value, str):
+                                ids.append(value)
+                if str(detail.get("@type", "")).endswith("RetryInfo"):
+                    seconds = detail.get("retryDelay", 0)
+                    if isinstance(seconds, str) and seconds.endswith("s"):
+                        try:
+                            retry_hint = max(retry_hint, float(seconds[:-1]))
+                        except ValueError:
+                            pass
+                    elif isinstance(seconds, dict):
+                        try:
+                            retry_hint = max(
+                                retry_hint,
+                                float(seconds.get("seconds", 0))
+                                + float(seconds.get("nanos", 0)) / 1_000_000_000,
+                            )
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        retry_after = float(headers.get("retry-after", 0))
+        retry_hint = max(retry_hint, retry_after)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        pass
+    if not math.isfinite(retry_hint) or retry_hint < 0:
+        retry_hint = 0.0
+    retry_hint = min(retry_hint, 86400.0)
+    evidence = " ".join(ids).lower().replace("_", "").replace("-", "")
+    # Quota identifiers often use PerDay / PerMinute with no spaces.
+    if "perday" in evidence or "per day" in evidence or "daily quota" in evidence:
+        return "daily", 0.0
+    if "perminute" in evidence or "per minute" in evidence or "permin" in evidence:
+        return "minute", max(_NO_TIMEOUT_MINUTE_COOLDOWN, retry_hint)
+    return "temporary_unknown", max(_NO_TIMEOUT_UNKNOWN_COOLDOWN, retry_hint)
+
+
+def _all_daily_keys_error(count: int) -> JaiResult:
+    track_stats("g.failed.client.quota")
+    return JaiResult(
+        429,
+        f"All {count} configured Google API key(s) reported a daily quota "
+        "limit. //notimeout stopped; daily quotas need to reset before retrying.",
+    )
+
+
 def _google_key(api_key: str) -> str:
     """Accept explicit google/ prefixed keys as well as ordinary Google keys."""
     return api_key.split("/", maxsplit=1)[1] if api_key.lower().startswith("google/") else api_key
@@ -453,16 +552,20 @@ def gemini_generate_content(
     # retry. Only 503 responses and socket timeouts advance the attempt count.
     retries, retry_delay = gemini_retry_config()
     no_timeout = gemini_no_timeout.get()
-    if no_timeout:
-        # No generation retry at all, even on 503 or socket failure.
-        # HTTP 429 key failover is NOT a generation retry and still works.
-        retries = 0
+    # Normal mode keeps the existing bounded retry policy unchanged.
+    # //notimeout uses an unbounded attempt iterator instead.
     max_attempts = retries + 1
     configured_keys = gemini_key_candidates.get()
     keys = configured_keys or ((1, api_key),)
     keys = tuple((index, _google_key(key)) for index, key in keys)
-    exhausted_keys: set[int] = set()
+    exhausted_keys: set[int] = set()  # Normal-mode 429s only.
+    daily_exhausted: set[int] = set()  # //notimeout terminal quotas.
+    key_cooldowns: dict[int, float] = {}  # //notimeout monotonic expiry.
     key_cursor = 0
+    cancel_token = gemini_wait_token.get() if no_timeout else None
+    if no_timeout and not cancel_token:
+        # Avoid an un-cancellable infinite operation if the route contract is broken.
+        raise RuntimeError("Missing //notimeout cancellation token")
     diagnostics = _diag_enabled()
     trace_id = secrets.token_hex(4) if diagnostics else ""
 
@@ -476,7 +579,7 @@ def gemini_generate_content(
             user,
             f"[Gemini diag {trace_id}] START model={model} "
             f"messages={len(messages)} payload_bytes={payload_bytes} "
-            f"attempts={max_attempts} "
+            f"attempts={'unlimited' if no_timeout else max_attempts} "
             f"attempt_budget={'disabled' if no_timeout else str(PROCESS_TIMEOUT) + 's'} "
             f"key_count={len(keys)} "
             f"lock={'renewed' if no_timeout else str(gemini_max_lock_seconds()) + 's'}",
@@ -484,20 +587,52 @@ def gemini_generate_content(
 
     try:
         finished = False
-        for attempt in range(max_attempts):
+        for attempt in (count() if no_timeout else range(max_attempts)):
             # Normal mode: every retry starts a fresh process-derived timeout;
             # 429 key switches share it. //notimeout skips the GFJ deadline.
             deadline = None if no_timeout else time.monotonic() + PROCESS_TIMEOUT
-            attempt_label = f"{attempt + 1}/{max_attempts}"
+            attempt_label = (
+                f"{attempt + 1}/unlimited" if no_timeout
+                else f"{attempt + 1}/{max_attempts}"
+            )
 
             while True:
-                if len(exhausted_keys) == len(keys):
-                    xlog(user, f"Gemini all {len(keys)} keys returned 429; stopping")
-                    return _quota_all_keys_error(len(keys))
-
-                # Skip keys that already returned 429 in this request.
-                while key_cursor in exhausted_keys:
-                    key_cursor = (key_cursor + 1) % len(keys)
+                if no_timeout:
+                    _no_timeout_check_cancelled(user, cancel_token)
+                    if len(daily_exhausted) == len(keys):
+                        xlog(user, "Gemini //notimeout: all keys hit daily quotas; stopping")
+                        return _all_daily_keys_error(len(keys))
+                    # Pick an eligible key, skipping daily-exhausted and cooling keys.
+                    # If all remaining keys are cooling, sleep (cancellably)
+                    # until the earliest one becomes available again.
+                    chosen = None
+                    now = time.monotonic()
+                    for offset in range(len(keys)):
+                        candidate = (key_cursor + offset) % len(keys)
+                        if (
+                            candidate not in daily_exhausted
+                            and key_cooldowns.get(candidate, 0.0) <= now
+                        ):
+                            chosen = candidate
+                            break
+                    if chosen is None:
+                        next_eligible = min(
+                            expiry for candidate, expiry in key_cooldowns.items()
+                            if candidate not in daily_exhausted
+                        )
+                        _no_timeout_sleep(
+                            user, cancel_token, "all available keys cooling down",
+                            max(0.0, next_eligible - now),
+                        )
+                        continue
+                    key_cursor = chosen
+                else:
+                    if len(exhausted_keys) == len(keys):
+                        xlog(user, f"Gemini all {len(keys)} keys returned 429; stopping")
+                        return _quota_all_keys_error(len(keys))
+                    # Skip keys that already returned 429 in this request.
+                    while key_cursor in exhausted_keys:
+                        key_cursor = (key_cursor + 1) % len(keys)
 
                 remaining = (
                     None if deadline is None else deadline - time.monotonic()
@@ -569,6 +704,9 @@ def gemini_generate_content(
                             f"Key {key_number}/{len(keys)} TIMEOUT "
                             f"type={type(exc).__name__}; elapsed {elapsed:.1f}s",
                         )
+                    if no_timeout:
+                        _no_timeout_sleep(user, cancel_token, "external read timeout", retry_delay)
+                        break
                     if attempt < retries:
                         _sleep_for_retry(user, "read timeout", retry_delay)
                         break
@@ -578,8 +716,8 @@ def gemini_generate_content(
                     # A transport failure is not a Google HTTP error response.
                     # In particular, HTTP/2 can report LocalProtocolError when
                     # a connection is closed while receiving a PING frame.
-                    # Honor the existing retry budget in normal mode, but never
-                    # retry a //notimeout request (retries is zero in that mode).
+                    # Normal mode retains its retry budget; //notimeout retries
+                    # indefinitely after a cancellable delay.
                     error_name = type(exc).__name__
                     elapsed = time.monotonic() - started
                     if diagnostics:
@@ -592,6 +730,11 @@ def gemini_generate_content(
                         f"Key {key_number}/{len(keys)}: {error_name} "
                         f"after {elapsed:.1f}s",
                     )
+                    if no_timeout:
+                        _no_timeout_sleep(
+                            user, cancel_token, "connection/protocol failure", retry_delay
+                        )
+                        break
                     if attempt < retries:
                         _sleep_for_retry(user, "connection/protocol failure", retry_delay)
                         break
@@ -625,8 +768,23 @@ def gemini_generate_content(
                     )
 
                 if response.status_code == 429:
-                    # 429 is a quota/key-selection issue, NOT a generation
-                    # retry. Do not try this key again within this request.
+                    if no_timeout:
+                        quota_kind, cooldown = _no_timeout_quota_info(response)
+                        if quota_kind == "daily":
+                            daily_exhausted.add(key_cursor)
+                            xlog(
+                                user, f"Gemini //notimeout Key {key_number}/{len(keys)} "
+                                "daily quota exhausted; skipping for this operation",
+                            )
+                        else:
+                            key_cooldowns[key_cursor] = time.monotonic() + cooldown
+                            xlog(
+                                user, f"Gemini //notimeout Key {key_number}/{len(keys)} "
+                                f"HTTP 429 ({quota_kind}); cooldown {cooldown:.1f}s",
+                            )
+                        key_cursor = (key_cursor + 1) % len(keys)
+                        continue
+                    # Normal-mode 429 behavior is unchanged.
                     exhausted_keys.add(key_cursor)
                     if len(exhausted_keys) == len(keys):
                         xlog(user, f"Gemini all {len(keys)} keys returned 429; stopping")
@@ -639,6 +797,12 @@ def gemini_generate_content(
                     )
                     continue
 
+                if no_timeout and response.status_code in (500, 502, 503, 504):
+                    _no_timeout_sleep(
+                        user, cancel_token, f"HTTP {response.status_code} overload/server error",
+                        retry_delay,
+                    )
+                    break
                 if response.status_code == 503 and attempt < retries:
                     _sleep_for_retry(user, "503 overload", retry_delay)
                     break
