@@ -433,8 +433,21 @@ Preset commands need to be called every time you want to use them.
 - `//banner`
   Shows you the banner, regardless of whether you have seen it before or if you use the `/quiet/` URL.
 
-- `//help advsettings|commands|dice|multikey|providers`
+- `//help [advsettings|commands|dice|multikey|providers|recovery|notimeout]`
   Shows you info about specific topics or proxy features.
+
+- `//recover` or `//recovery`
+  Return the latest completed assistant reply saved in Redis without calling an AI provider.
+  Put it at the beginning or end of a message. See `//help recovery`.
+
+- `//notimeout`
+  For this one DIRECT Google Gemini request only: disable GFJ's HTTP read deadline
+  and keep retrying recoverable errors, using progressive delays after repeated 503s.
+  Put it at the beginning or end of a message. See `//help notimeout`.
+
+- `//stopwait` or `//notimeoutdisable`
+  Cancel the currently active `//notimeout` request, including while it is waiting.
+  This does not permanently change future requests. See `//help notimeout`.
 
 - `//fixturns on|off|this`
   Adds an empty user message to the end of the conversation, fixing the issues with models that can't take prefills right away.
@@ -662,6 +675,17 @@ To use any model through OpenRouter, you must add `openrouter/` first and then t
 
 All API keys that start with `sk-or-v1-` will be used with OpenRouter.
 
+## **LoreBary** (`lorebary`)
+
+The custom LoreBary integration is selected by a dedicated GFJ proxy URL, for example:
+`/quiet/lorebary/aistudio/chat/completions`.
+
+Available route names: `aistudio`, `openrouter`, `anthropic`, `openai`,
+`deepseek`, `mistral`, `chutes`, `lorellm`. GFJ forwards one selected key
+from your multikey list to the corresponding LoreBary endpoint. This uses a
+third-party service, **not** the direct Google API path, and direct-Google
+`//notimeout` does not apply.
+
 ## **Z.AI** (`z_ai`)
 
 `https://chat.z.ai/`
@@ -672,23 +696,71 @@ You must add `z_ai/` at the start of any Z.AI API key.
 """
 
 
+# GFJ HELP EXTENSION: recovery, notimeout and LoreBary (2026-11-22)
+HELP_RECOVERY = """***
+# **Recover a saved response**
+
+- `//recover` and `//recovery` are aliases.
+- They return the latest *successful* assistant reply previously saved in Redis,
+  without making another Google request or using your API quota.
+- Add either command at the beginning or end of the newest user message.
+- Recovery is not tied to a particular prompt: it returns the most recently saved reply.
+- The saved response is tied to your GFJ user identity, derived from your first API key.
+  Changing that first key or switching providers may give you a different identity.
+- If a `//notimeout` generation is still running, recovery does not stop it.
+  To cancel a running generation, use `//stopwait`.
+- Requires enabled response recovery and Redis. Normal successful replies replace
+  the previous saved reply. Redis eviction or an optional TTL may remove it.
+"""
+
+HELP_NOTIMEOUT = """***
+# **Unlimited waiting and overload backoff**
+
+- `//notimeout` applies only to the *current message* through direct Google Gemini.
+  It does not enable a permanent mode or apply to Z.AI or LoreBary.
+- It disables GFJ's HTTP read timeout and permits unlimited retries for recoverable
+  Google server and network errors. External provider / hosting failures remain possible.
+- Progressive wait after consecutive HTTP 503 responses:
+  1-3: 75 seconds; 4-6: 180 seconds; 7-10: 300 seconds; 11+: 600 seconds.
+  A higher configured Gemini retry delay remains the minimum.
+- A Google HTTP 429 does NOT reset the accumulated 503 overload history.
+  Switching to another eligible key is immediate (there is no 5-minute pause
+  before trying it). If that new key returns HTTP 503, its first retry wait
+  starts at 5 minutes. Later 503s can reach the preserved 10-minute stage.
+- Temporary HTTP 429 quota responses use cooldowns and key failover; confirmed
+  daily quota exhaustion skips that key for the current operation. If all keys
+  report daily exhaustion, GFJ stops rather than waiting for quota resets.
+- `//stopwait` (alias `//notimeoutdisable`) cancels the active unlimited request,
+  even during retry delays. It does not disable a persistent user setting.
+- Successful responses are stored for `//recover` when recovery is enabled.
+- A `//notimeout` request can remain active after JanitorAI disconnects. Its
+  Google request may still finish; recover the last saved response afterward.
+- `//notimeout` and `//stopwait` are intercepted before the standard command
+  parser so the commands are removed from the model prompt.
+"""
+
 HELP = {
     "advsettings": HELP_ADVSETTINGS,
     "commands": HELP_COMMANDS,
     "dice": HELP_DICE,
     "multikey": HELP_MULTIKEY,
     "providers": HELP_PROVIDERS,
+    "recovery": HELP_RECOVERY,
+    "notimeout": HELP_NOTIMEOUT,
+    "retries": HELP_NOTIMEOUT,
 }
 
 
-@command(argspec=r".+")
+@command(argspec=r".*")
 def help(args, user, jai_req, response):
+    args = args.strip().lower() or "commands"
     response.add_proxy_message(
         HELP.get(
             args,
             (
                 f"There is no help topic `{args}`.\n"
-                + "Available topics are: `commands`, `dice`, `multikey`, `providers`."
+                + "Available topics are: `advsettings`, `commands`, `dice`, "
+                + "`multikey`, `providers`, `recovery`, `notimeout`, `retries`."
             ),
         )
     )
