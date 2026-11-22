@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from itertools import count
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -286,17 +286,17 @@ except ZoneInfoNotFoundError:
 
 def _no_timeout_local_hour() -> int:
     """Current Amsterdam hour; automatically handles winter and summer time."""
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     if _NO_TIMEOUT_BACKOFF_ZONE is not None:
         return now_utc.astimezone(_NO_TIMEOUT_BACKOFF_ZONE).hour
 
     # EU daylight saving time: last Sunday of March at 01:00 UTC through the
     # last Sunday of October at 01:00 UTC. Dutch time is UTC+1/UTC+2.
     year = now_utc.year
-    march_last_sunday = 31 - ((datetime(year, 3, 31).weekday() + 1) % 7)
-    october_last_sunday = 31 - ((datetime(year, 10, 31).weekday() + 1) % 7)
-    summer_start = datetime(year, 3, march_last_sunday, 1, tzinfo=timezone.utc)
-    summer_end = datetime(year, 10, october_last_sunday, 1, tzinfo=timezone.utc)
+    march_last_sunday = 31 - ((datetime(year, 3, 31, tzinfo=UTC).weekday() + 1) % 7)
+    october_last_sunday = 31 - ((datetime(year, 10, 31, tzinfo=UTC).weekday() + 1) % 7)
+    summer_start = datetime(year, 3, march_last_sunday, 1, tzinfo=UTC)
+    summer_end = datetime(year, 10, october_last_sunday, 1, tzinfo=UTC)
     offset_hours = 2 if summer_start <= now_utc < summer_end else 1
     return (now_utc + timedelta(hours=offset_hours)).hour
 
