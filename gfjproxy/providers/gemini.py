@@ -8,8 +8,10 @@ import threading
 import time
 from collections import deque
 from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from itertools import count
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 
@@ -272,20 +274,75 @@ _NO_TIMEOUT_UNKNOWN_COOLDOWN = 600.0
 _NO_TIMEOUT_POLL_SECONDS = 2.0
 
 
-def _no_timeout_503_delay(consecutive_503s: int, retry_delay: float) -> float:
-    """Increase //notimeout backoff when Google repeatedly returns HTTP 503.
+# All time windows are based on Dutch civil time, including DST, rather than
+# the hosting server's time zone (often UTC on Render).
+try:
+    _NO_TIMEOUT_BACKOFF_ZONE = ZoneInfo("Europe/Amsterdam")
+except ZoneInfoNotFoundError:
+    # Some minimal container images omit the IANA tzdata database. The European
+    # DST rule provides the same Amsterdam hours without a new dependency.
+    _NO_TIMEOUT_BACKOFF_ZONE = None
 
-    The first three failures retain the configured retry delay (75s by
-    default). Higher stages never shorten an explicitly configured delay.
-    This changes neither active HTTP timeouts nor normal-mode retry policy.
+
+def _no_timeout_local_hour() -> int:
+    """Current Amsterdam hour; automatically handles winter and summer time."""
+    now_utc = datetime.now(timezone.utc)
+    if _NO_TIMEOUT_BACKOFF_ZONE is not None:
+        return now_utc.astimezone(_NO_TIMEOUT_BACKOFF_ZONE).hour
+
+    # EU daylight saving time: last Sunday of March at 01:00 UTC through the
+    # last Sunday of October at 01:00 UTC. Dutch time is UTC+1/UTC+2.
+    year = now_utc.year
+    march_last_sunday = 31 - ((datetime(year, 3, 31).weekday() + 1) % 7)
+    october_last_sunday = 31 - ((datetime(year, 10, 31).weekday() + 1) % 7)
+    summer_start = datetime(year, 3, march_last_sunday, 1, tzinfo=timezone.utc)
+    summer_end = datetime(year, 10, october_last_sunday, 1, tzinfo=timezone.utc)
+    offset_hours = 2 if summer_start <= now_utc < summer_end else 1
+    return (now_utc + timedelta(hours=offset_hours)).hour
+
+
+def _no_timeout_503_delay(
+    consecutive_503s: int,
+    retry_delay: float,
+    *,
+    after_key_switch: bool = False,
+    first_503_after_switch: bool = False,
+) -> float:
+    """Scheduled //notimeout backoff, based on local Dutch time at each 503.
+
+    09:00-18:00: 75s / 180s / 300s / 600s, by consecutive 503 count.
+    18:00-22:00 and 06:00-09:00: same stages, capped at 300s.
+    22:00-06:00: always 75s, overriding the post-key-switch floor.
+
+    An HTTP 429 still switches keys immediately. If the next key produces a
+    503, its first retry is 300s in daytime/shoulder periods, and subsequent
+    failures can return to the preserved 600s stage only in daytime.
     """
+    hour = _no_timeout_local_hour()
+    if hour >= 22 or hour < 6:
+        return 75.0
+
     if consecutive_503s <= 3:
-        return retry_delay
-    if consecutive_503s <= 6:
-        return max(retry_delay, 180.0)
-    if consecutive_503s <= 10:
-        return max(retry_delay, 300.0)
-    return max(retry_delay, 600.0)
+        delay = retry_delay
+    elif consecutive_503s <= 6:
+        delay = max(retry_delay, 180.0)
+    elif consecutive_503s <= 10:
+        delay = max(retry_delay, 300.0)
+    else:
+        delay = max(retry_delay, 600.0)
+
+    if after_key_switch:
+        # Preserve the previous 5-minute key-switch protection, except that
+        # nighttime is explicitly faster. The next API key is still tried
+        # immediately; this only applies AFTER its own HTTP 503 response.
+        if first_503_after_switch:
+            delay = max(retry_delay, 300.0)
+        else:
+            delay = max(delay, 300.0)
+
+    if hour < 9 or hour >= 18:
+        delay = min(delay, 300.0)
+    return delay
 
 
 def _no_timeout_check_cancelled(user: XUID, token: str) -> None:
@@ -580,7 +637,8 @@ def gemini_generate_content(
     key_cursor = 0
     # A 429 is a key-specific quota event, not proof that the model overload ended.
     # Preserve 503 history across a 429 key switch. Once a different key is
-    # actually attempted, begin its overload retry delays at five minutes.
+    # actually attempted, begin its overload retry delays at five minutes
+    # outside the 22:00-06:00 nighttime window.
     consecutive_503s = 0
     previous_key_cursor: int | None = None
     after_key_switch = False
@@ -669,7 +727,7 @@ def gemini_generate_content(
 
                 key_number, current_key = keys[key_cursor]
                 if no_timeout:
-                    # Only an actual key change activates the 5-minute floor.
+                    # Only an actual key change activates the daytime 5-minute floor.
                     # In //notimeout, keys change after a 429, never after a 503.
                     if previous_key_cursor is not None and key_cursor != previous_key_cursor:
                         after_key_switch = True
@@ -837,18 +895,14 @@ def gemini_generate_content(
                 if no_timeout and response.status_code in (500, 502, 503, 504):
                     if response.status_code == 503:
                         consecutive_503s += 1
-                        delay = _no_timeout_503_delay(consecutive_503s, retry_delay)
-                        if after_key_switch:
-                            if first_503_after_switch:
-                                # Give the new key one immediate opportunity.
-                                # If it also reports 503, start with a 5-minute
-                                # delay even when the previous key was at 10m.
-                                delay = max(retry_delay, 300.0)
-                                first_503_after_switch = False
-                            else:
-                                # After the first failed call, preserve the
-                                # request-wide 503 streak and its 10m stage.
-                                delay = max(delay, 300.0)
+                        delay = _no_timeout_503_delay(
+                            consecutive_503s,
+                            retry_delay,
+                            after_key_switch=after_key_switch,
+                            first_503_after_switch=first_503_after_switch,
+                        )
+                        if after_key_switch and first_503_after_switch:
+                            first_503_after_switch = False
                         cause = f"HTTP 503 overload (consecutive 503s: {consecutive_503s})"
                     else:
                         delay = retry_delay
