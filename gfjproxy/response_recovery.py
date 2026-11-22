@@ -50,6 +50,12 @@ def _remove_control_commands(content: str) -> tuple[set[str], str]:
     commands do. Placement checks avoid triggering on dialogue or quoted code
     in the middle of a line. A speaker prefix is accepted for JanitorAI.
     """
+    # A long RP may contain hundreds of historical user messages. Nearly all
+    # lack controls, so avoid tokenizing them on every new generation. Any
+    # recognized control MUST contain these exact two slash characters.
+    if "//" not in content:
+        return set(), content
+
     tokens = list(_tokenize(content))
     positions = []
     cursor = 0
