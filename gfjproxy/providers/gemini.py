@@ -272,6 +272,22 @@ _NO_TIMEOUT_UNKNOWN_COOLDOWN = 600.0
 _NO_TIMEOUT_POLL_SECONDS = 2.0
 
 
+def _no_timeout_503_delay(consecutive_503s: int, retry_delay: float) -> float:
+    """Increase //notimeout backoff when Google repeatedly returns HTTP 503.
+
+    The first three failures retain the configured retry delay (75s by
+    default). Higher stages never shorten an explicitly configured delay.
+    This changes neither active HTTP timeouts nor normal-mode retry policy.
+    """
+    if consecutive_503s <= 3:
+        return retry_delay
+    if consecutive_503s <= 6:
+        return max(retry_delay, 180.0)
+    if consecutive_503s <= 10:
+        return max(retry_delay, 300.0)
+    return max(retry_delay, 600.0)
+
+
 def _no_timeout_check_cancelled(user: XUID, token: str) -> None:
     """Cancel even while between Google calls or waiting for quota reset."""
     if wait_should_stop(user, token):
@@ -562,6 +578,13 @@ def gemini_generate_content(
     daily_exhausted: set[int] = set()  # //notimeout terminal quotas.
     key_cooldowns: dict[int, float] = {}  # //notimeout monotonic expiry.
     key_cursor = 0
+    # A 429 is a key-specific quota event, not proof that the model overload ended.
+    # Preserve 503 history across a 429 key switch. Once a different key is
+    # actually attempted, begin its overload retry delays at five minutes.
+    consecutive_503s = 0
+    previous_key_cursor: int | None = None
+    after_key_switch = False
+    first_503_after_switch = False
     cancel_token = gemini_wait_token.get() if no_timeout else None
     if no_timeout and not cancel_token:
         # Avoid an un-cancellable infinite operation if the route contract is broken.
@@ -645,6 +668,13 @@ def gemini_generate_content(
                     return JaiResult(504, "Gateway Timeout")
 
                 key_number, current_key = keys[key_cursor]
+                if no_timeout:
+                    # Only an actual key change activates the 5-minute floor.
+                    # In //notimeout, keys change after a 429, never after a 503.
+                    if previous_key_cursor is not None and key_cursor != previous_key_cursor:
+                        after_key_switch = True
+                        first_503_after_switch = True
+                    previous_key_cursor = key_cursor
                 started = time.monotonic()
                 connection_trace = _ConnectionTrace() if diagnostics else None
                 stopped = None
@@ -705,6 +735,7 @@ def gemini_generate_content(
                             f"type={type(exc).__name__}; elapsed {elapsed:.1f}s",
                         )
                     if no_timeout:
+                        consecutive_503s = 0
                         _no_timeout_sleep(user, cancel_token, "external read timeout", retry_delay)
                         break
                     if attempt < retries:
@@ -731,6 +762,7 @@ def gemini_generate_content(
                         f"after {elapsed:.1f}s",
                     )
                     if no_timeout:
+                        consecutive_503s = 0
                         _no_timeout_sleep(
                             user, cancel_token, "connection/protocol failure", retry_delay
                         )
@@ -767,6 +799,11 @@ def gemini_generate_content(
                         f"attempt remaining {remaining_description}",
                     )
 
+                if no_timeout and response.status_code not in (429, 503):
+                    # 429 does not resolve an ongoing model overload; it only
+                    # changes which Google project can accept the next call.
+                    consecutive_503s = 0
+
                 if response.status_code == 429:
                     if no_timeout:
                         quota_kind, cooldown = _no_timeout_quota_info(response)
@@ -798,10 +835,25 @@ def gemini_generate_content(
                     continue
 
                 if no_timeout and response.status_code in (500, 502, 503, 504):
-                    _no_timeout_sleep(
-                        user, cancel_token, f"HTTP {response.status_code} overload/server error",
-                        retry_delay,
-                    )
+                    if response.status_code == 503:
+                        consecutive_503s += 1
+                        delay = _no_timeout_503_delay(consecutive_503s, retry_delay)
+                        if after_key_switch:
+                            if first_503_after_switch:
+                                # Give the new key one immediate opportunity.
+                                # If it also reports 503, start with a 5-minute
+                                # delay even when the previous key was at 10m.
+                                delay = max(retry_delay, 300.0)
+                                first_503_after_switch = False
+                            else:
+                                # After the first failed call, preserve the
+                                # request-wide 503 streak and its 10m stage.
+                                delay = max(delay, 300.0)
+                        cause = f"HTTP 503 overload (consecutive 503s: {consecutive_503s})"
+                    else:
+                        delay = retry_delay
+                        cause = f"HTTP {response.status_code} overload/server error"
+                    _no_timeout_sleep(user, cancel_token, cause, delay)
                     break
                 if response.status_code == 503 and attempt < retries:
                     _sleep_for_retry(user, "503 overload", retry_delay)
